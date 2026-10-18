@@ -123,6 +123,16 @@ jobs:
           fi
           echo "KARCH=$KARCH" >> $GITHUB_ENV
 
+      - name: Clean kernel tree before build (both cold and hot)
+        run: |
+          cd android-kernel/common
+          KARCH="${{ steps.set_arch.outputs.KARCH }}"
+          # 热运行时缓存里可能没有 arm 的 defconfig，回退逻辑要一致
+          if [ ! -f "arch/$KARCH/configs/gki_defconfig" ]; then
+            KARCH=arm64
+          fi
+          make ARCH=$KARCH LLVM=1 mrproper
+
       # 只编译你的模块（冷/热都走这里）
       - name: Build kernel module (external module only)
         run: |
