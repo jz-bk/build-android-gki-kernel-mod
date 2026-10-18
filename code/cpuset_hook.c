@@ -11,6 +11,7 @@
 #include <linux/uidgid.h>
 #include <linux/workqueue.h>
 #include <linux/slab.h>
+#include <linux/atomic.h>
 
 #define GAME_PKG    "com.tencent.ig"
 
@@ -50,6 +51,8 @@ static unsigned long (*set_cpus_allowed_ptr_sym)(struct task_struct *,
 static uid_t g_game_uid = (uid_t)-1;
 
 static struct kprobe kp_setaffinity;
+
+static atomic_t g_affinity_calls = ATOMIC_INIT(0);
 
 /* ---------------- 规则表 ---------------- */
 struct thread_rule {
@@ -140,9 +143,7 @@ static int setaffinity_handler(struct kprobe *p, struct pt_regs *regs)
 {
     struct cred *cred;
     uid_t uid;
-    struct thread_rule *r;
-    const struct cpumask *mask;
-    struct affinity_work *aw;
+    int calls;
 
     rcu_read_lock();
     cred = (struct cred *)__task_cred(current);
@@ -152,25 +153,29 @@ static int setaffinity_handler(struct kprobe *p, struct pt_regs *regs)
     if (uid != g_game_uid)
         return 0;
 
-    r = pick_rule(current->comm);
-    mask = r ? &r->mask : &default_mask;
+    calls = atomic_inc_return(&g_affinity_calls);
 
-    /* 如果当前掩码已经是目标值，不用管 */
-    if (cpumask_equal(&current->cpus_mask, mask))
-        return 0;   /* 放行原函数 */
+    /* 每 1000 次打一条总量日志 */
+    if (calls % 1000 == 0)
+        pr_info("setaffinity_stat: total=%d last_comm=%s\n",
+                calls, current->comm);
 
-    /* 异步纠正：扔进 workqueue，稍后改回来 */
-    aw = kmalloc(sizeof(*aw), GFP_ATOMIC);
-    if (!aw)
-        return 0;
+    /* UEGameThread 每次调用都打，看它的掩码变化 */
+    if (strncmp(current->comm, "UEGameThread", 12) == 0) {
+        pr_info("setaffinity_ue: comm=%s pid=%d cur_mask=%lx\n",
+                current->comm, current->pid,
+                *(unsigned long *)&current->cpus_mask);
+    }
 
-    INIT_WORK(&aw->work, affinity_work_fn);
-    get_task_struct(current);
-    aw->task = current;
-    aw->mask = *mask;
-    schedule_work(&aw->work);
+    /* RHIThread / RenderThread 也各打一条，看频率 */
+    if (strncmp(current->comm, "RHIThread", 9) == 0 ||
+        strncmp(current->comm, "RenderThread", 12) == 0) {
+        pr_info("setaffinity_key: comm=%s pid=%d cur_mask=%lx\n",
+                current->comm, current->pid,
+                *(unsigned long *)&current->cpus_mask);
+    }
 
-    return 0;   /* 放行原函数，游戏正常返回 */
+    return 0;   /* 放行原函数，不拦截 */
 }
 
 /* ---------------- 模块入口 ---------------- */
