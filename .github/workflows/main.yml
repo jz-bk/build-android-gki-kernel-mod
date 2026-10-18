@@ -1,32 +1,9 @@
-name: Android Kernel Driver Builder
-
-on:
-  workflow_dispatch:
-    inputs:
-      android_version:
-        description: 'Android Version (Kernel)'
-        required: true
-        type: choice
-        options:
-          - common-android12-5.10
-          - common-android13-5.10
-          - common-android13-5.15
-          - common-android14-5.15
-          - common-android14-6.1
-          - common-android15-6.6
-          - common-android16-6.12
-          - common-android17-6.18
-      target_arch:
-        description: 'Target Architecture (aarch64, armv7l)'
-        required: true
-        type: choice
-        options:
-        - aarch64
-        - armv7l
-
 jobs:
   build:
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/ylarod/ddk:${{ github.event.inputs.android_version }}-20251016
+      options: --privileged
 
     steps:
       - name: Checkout repository
@@ -34,7 +11,7 @@ jobs:
 
       - name: Prepare kerneldriver directory
         run: |
-          mkdir kerneldriver
+          mkdir -p kerneldriver
           find ./code -maxdepth 1 \( -name "*.h" -o -name "*.c" -o -name "Makefile" \) -exec cp {} kerneldriver/ \;
 
       - name: Auto-detect driver module name
@@ -43,120 +20,28 @@ jobs:
           cd kerneldriver
           MODULE_OBJ=$(grep -E '^obj-[my]\s*[:+]?=' Makefile | head -n1 | awk '{print $3}' | sed 's/\.o$/.ko/')
           if [ -z "$MODULE_OBJ" ]; then
-            echo "Error: Cannot find 'obj-m' or 'obj-y' in Makefile" >&2
+            echo "Error: Cannot find 'obj-m' in Makefile" >&2
             exit 1
           fi
           echo "Detected module: $MODULE_OBJ"
           echo "module_name=$MODULE_OBJ" >> $GITHUB_OUTPUT
 
-      - name: Install repo tool
-        run: |
-          sudo curl -L https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
-          sudo chmod a+x /usr/local/bin/repo
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python-is-python3 clang lld llvm
-
-      # 确定架构映射
-      - name: Set kernel arch
-        id: set_arch
-        run: |
-          if [ "${{ github.event.inputs.target_arch }}" = "armv7l" ]; then
-            echo "KARCH=arm" >> $GITHUB_OUTPUT
-          else
-            echo "KARCH=arm64" >> $GITHUB_OUTPUT
-          fi
-
-      # 尝试恢复“已准备好的内核构建环境”
-      - name: Restore prepared kernel build env
-        id: cache-kernel-env
-        uses: actions/cache/restore@v4
-        with:
-          path: android-kernel
-          key: kernel-prepared-${{ github.event.inputs.android_version }}-${{ steps.set_arch.outputs.KARCH }}
-
-      # 如果缓存未命中，从源码准备（这一步只在首次运行时发生）
-      - name: Set up Android Kernel source (cold)
-        if: steps.cache-kernel-env.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p android-kernel && cd android-kernel
-          repo init -u https://android.googlesource.com/kernel/manifest -b ${{ github.event.inputs.android_version }}
-          repo sync -j$(nproc) -c --no-tags --optimized-fetch --force-sync
-
-      - name: Prepare kernel build environment (cold only)
-        if: steps.cache-kernel-env.outputs.cache-hit != 'true'
-        run: |
-          cd android-kernel/common
-          KARCH="${{ steps.set_arch.outputs.KARCH }}"
-
-          DEFCONFIG="arch/$KARCH/configs/gki_defconfig"
-          if [ ! -f "$DEFCONFIG" ]; then
-            echo "⚠️  $DEFCONFIG not found, falling back to arm64"
-            KARCH=arm64
-            DEFCONFIG="arch/arm64/configs/gki_defconfig"
-          fi
-          echo "KARCH=$KARCH" >> $GITHUB_ENV
-
-          make ARCH=$KARCH LLVM=1 mrproper
-          make ARCH=$KARCH LLVM=1 gki_defconfig
-          make ARCH=$KARCH LLVM=1 modules_prepare -j$(nproc)
-          make ARCH=$KARCH LLVM=1 modules -j$(nproc)
-
-      # 保存准备好的环境（仅冷运行时）
-      - name: Save prepared kernel build env
-        if: steps.cache-kernel-env.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: android-kernel
-          key: kernel-prepared-${{ github.event.inputs.android_version }}-${{ steps.set_arch.outputs.KARCH }}
-
-      # 热运行时也需要知道 KARCH
-      - name: Set KARCH for build (hot path)
-        if: steps.cache-kernel-env.outputs.cache-hit == 'true'
-        run: |
-          KARCH="${{ steps.set_arch.outputs.KARCH }}"
-          # 检查恢复的环境里是否有 arm 的 defconfig，没有则回退
-          if [ ! -f "android-kernel/common/arch/$KARCH/configs/gki_defconfig" ]; then
-            KARCH=arm64
-          fi
-          echo "KARCH=$KARCH" >> $GITHUB_ENV
-
-      - name: Clean kernel tree before build (both cold and hot)
-        run: |
-          cd android-kernel/common
-          KARCH="${{ steps.set_arch.outputs.KARCH }}"
-          # 热运行时缓存里可能没有 arm 的 defconfig，回退逻辑要一致
-          if [ ! -f "arch/$KARCH/configs/gki_defconfig" ]; then
-            KARCH=arm64
-          fi
-          make ARCH=$KARCH LLVM=1 mrproper
-
-      # 只编译你的模块（冷/热都走这里）
-      - name: Build kernel module (external module only)
+      - name: Build kernel module
         run: |
           cd kerneldriver
-          make -C ../android-kernel/common \
-               ARCH=$KARCH \
-               LLVM=1 \
-               M=$PWD \
-               modules -j$(nproc)
+          make -C $KERNEL_SRC M=$PWD modules
 
       - name: Stage driver artifacts
         run: |
           mkdir -p upload_artifact
           TARGET_MODULE="${{ steps.detect_module.outputs.module_name }}"
-          MODULE_FILE=$(find kerneldriver -maxdepth 1 -name "$TARGET_MODULE" -type f | head -1)
-
+          MODULE_FILE=$(find kerneldriver -name "$TARGET_MODULE" -type f | head -1)
           if [ -z "$MODULE_FILE" ]; then
-            echo "❌ Module not found! Available .ko files:"
-            find kerneldriver -name "*.ko" | head -10
+            echo "Module not found"
             exit 1
           fi
-
-          echo "✅ Found module at: $MODULE_FILE"
           cp "$MODULE_FILE" upload_artifact/
+          llvm-strip -d "upload_artifact/$TARGET_MODULE" || true
           ls -lh upload_artifact/
 
       - name: Upload artifacts
