@@ -143,7 +143,9 @@ static int setaffinity_handler(struct kprobe *p, struct pt_regs *regs)
 {
     struct cred *cred;
     uid_t uid;
-    int calls;
+    struct thread_rule *r;
+    const struct cpumask *mask;
+    int ret;
 
     rcu_read_lock();
     cred = (struct cred *)__task_cred(current);
@@ -153,37 +155,24 @@ static int setaffinity_handler(struct kprobe *p, struct pt_regs *regs)
     if (uid != g_game_uid)
         return 0;
 
-    /* 编译期引用，避免 -Werror unused */
-    if (0) {
-        struct thread_rule *r = pick_rule(current->comm);
-        (void)r;
-        (void)default_mask;
-        (void)affinity_work_fn;
-    }
-    
-    calls = atomic_inc_return(&g_affinity_calls);
+    r = pick_rule(current->comm);
+    mask = r ? &r->mask : &default_mask;
 
-    /* 每 1000 次打一条总量日志 */
-    if (calls % 1000 == 0)
-        pr_info("setaffinity_stat: total=%d last_comm=%s\n",
-                calls, current->comm);
-
-    /* UEGameThread 每次调用都打，看它的掩码变化 */
-    if (strncmp(current->comm, "UEGameThread", 12) == 0) {
-        pr_info("setaffinity_ue: comm=%s pid=%d cur_mask=%lx\n",
-                current->comm, current->pid,
-                *(unsigned long *)&current->cpus_mask);
+    /* 已经是目标掩码：直接伪造成功返回，不碰调度器 */
+    if (cpumask_equal(&current->cpus_mask, mask)) {
+        regs->regs[0] = 0;
+        return 1;
     }
 
-    /* RHIThread / RenderThread 也各打一条，看频率 */
-    if (strncmp(current->comm, "RHIThread", 9) == 0 ||
-        strncmp(current->comm, "RenderThread", 12) == 0) {
-        pr_info("setaffinity_key: comm=%s pid=%d cur_mask=%lx\n",
-                current->comm, current->pid,
-                *(unsigned long *)&current->cpus_mask);
-    }
+    /* 不一致：同步改一次 */
+    ret = call_set_affinity(current, mask);
+    if (ret)
+        pr_err("setaffinity_hook: comm=%s pid=%d ret=%d\n",
+               current->comm, current->pid, ret);
 
-    return 0;   /* 放行原函数，不拦截 */
+    /* 无论成功失败，都伪造成功返回，跳过原函数 */
+    regs->regs[0] = 0;
+    return 1;
 }
 
 /* ---------------- 模块入口 ---------------- */
