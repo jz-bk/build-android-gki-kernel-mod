@@ -41,7 +41,11 @@
 #include <linux/ftrace.h>
 #include <linux/atomic.h>
 #include <trace/hooks/sched.h>
+#include <linux/bitmap.h>
 
+/* 打印 cpumask 为 "0-6" / "4-7" 这种形式，比 %lx 直观，且不受 NR_CPUS 影响 */
+#define MASK_FMT "%*pbl"
+#define MASK_ARG(m) cpumask_pr_args(m)
 #define GAME_PKG "com.tencent.ig"
 
 static uid_t g_game_uid = (uid_t)-1;
@@ -171,10 +175,21 @@ static void affinity_work_fn(struct work_struct *work)
     ret = call_set_affinity(aw->task, &aw->mask);
     if (ret) {
         atomic64_inc(&cnt_work_fail);
-        pr_warn("cpuset_hook_v3: set affinity pid=%d comm=%s ret=%d\n",
-                aw->task->pid, aw->task->comm, ret);
+        pr_warn("cpuset_hook_v3: work FAIL pid=%d comm=%s want=" MASK_FMT
+                " ret=%d now=" MASK_FMT "\n",
+                aw->task->pid, aw->task->comm,
+                MASK_ARG(&aw->mask), ret,
+                MASK_ARG(&aw->task->cpus_mask));
     } else {
         atomic64_inc(&cnt_work_ok);
+        /* 成功也打：对比 want 和 now，若不等说明内核/厂商改写了掩码 */
+        pr_info_ratelimited("cpuset_hook_v3: work OK pid=%d comm=%s want=" MASK_FMT
+                            " now=" MASK_FMT "%s\n",
+                            aw->task->pid, aw->task->comm,
+                            MASK_ARG(&aw->mask),
+                            MASK_ARG(&aw->task->cpus_mask),
+                            cpumask_equal(&aw->task->cpus_mask, &aw->mask)
+                                ? "" : "  <-- MISMATCH!");
     }
     put_task_struct(aw->task);
     kfree(aw);
@@ -203,11 +218,6 @@ static void queue_affinity(struct task_struct *p, const struct cpumask *mask,
     }
 }
 
-/*
- * fork: child inherits parent's comm at this point, so we cannot apply
- * named rules here. Apply default 0x7F; task_rename will promote named
- * threads to 0xF0 once they get their final comm.
- */
 static void on_sched_process_fork(void *ignore, struct task_struct *parent,
                                   struct task_struct *child)
 {
@@ -223,12 +233,11 @@ static void on_sched_process_fork(void *ignore, struct task_struct *parent,
 
     queue_affinity(child, &default_mask, GFP_ATOMIC);
     atomic64_inc(&cnt_fork);
+    pr_info_ratelimited("cpuset_hook_v3: fork pid=%d comm=%s -> default="
+                        MASK_FMT "\n",
+                        child->pid, child->comm, MASK_ARG(&default_mask));
 }
 
-/*
- * rename: apply the named rule if matched; fall back to default 0x7F
- * otherwise. A thread renamed away from a special name is demoted to 0-6.
- */
 static void on_task_rename(void *ignore, struct task_struct *p,
                            const char *newcomm)
 {
@@ -246,6 +255,11 @@ static void on_task_rename(void *ignore, struct task_struct *p,
     r = pick_rule(newcomm);
     queue_affinity(p, r ? &r->mask : &default_mask, GFP_ATOMIC);
     atomic64_inc(&cnt_rename);
+    pr_info_ratelimited("cpuset_hook_v3: rename pid=%d newcomm='%s' rule=%s "
+                        "mask=" MASK_FMT "\n",
+                        p->pid, newcomm,
+                        r ? r->name : "(none)",
+                        MASK_ARG(r ? &r->mask : &default_mask));
 }
 
 /*
@@ -259,8 +273,6 @@ static void on_sched_setaffinity_early(void *ignore, struct task_struct *p,
     const struct cred *cred;
     uid_t uid;
 
-    (void)new_mask;
-
     rcu_read_lock();
     cred = __task_cred(p);
     uid = __kuid_val(cred->uid);
@@ -270,6 +282,16 @@ static void on_sched_setaffinity_early(void *ignore, struct task_struct *p,
 
     *skip = true;
     atomic64_inc(&cnt_hook_skip);
+
+    /* 前 50 次无条件打，之后限流；确认 hook 语义和游戏意图 */
+    if (atomic64_read(&cnt_hook_skip) <= 50)
+        pr_info("cpuset_hook_v3: hook pid=%d comm=%s want=" MASK_FMT
+                " skip=true\n",
+                p->pid, p->comm, MASK_ARG(new_mask));
+    else
+        pr_info_ratelimited("cpuset_hook_v3: hook pid=%d comm=%s want=" MASK_FMT
+                            " skip=true\n",
+                            p->pid, p->comm, MASK_ARG(new_mask));
 }
 
 struct tp_find_ctx {
