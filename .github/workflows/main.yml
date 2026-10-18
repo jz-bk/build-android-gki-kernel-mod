@@ -57,7 +57,9 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python-is-python3
+          sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python-is-python3 clang lld llvm
+          clang --version
+          ld.lld --version
 
       - name: Restore kernel source cache
         id: cache-kernel
@@ -82,7 +84,6 @@ jobs:
           path: android-kernel
           key: kernel-src-${{ github.event.inputs.android_version }}
 
-      # ===== 路径 A 核心：只做一次内核构建环境准备，不完整编译 =====
       - name: Prepare kernel build environment (config + modules_prepare)
         run: |
           cd android-kernel/common
@@ -93,25 +94,24 @@ jobs:
           else
             KARCH=arm64
           fi
+
+          # armv7l 若没有专用 gki_defconfig，回退到 arm64
+          DEFCONFIG="arch/$KARCH/configs/gki_defconfig"
+          if [ ! -f "$DEFCONFIG" ]; then
+            echo "⚠️  $DEFCONFIG not found, falling back to arm64 gki_defconfig"
+            KARCH=arm64
+            DEFCONFIG="arch/arm64/configs/gki_defconfig"
+          fi
           echo "KARCH=$KARCH" >> $GITHUB_ENV
 
           # 先清理源码树，避免残留产物导致 modules_prepare 误入 headers_install
-          make ARCH=$KARCH mrproper
-
-          # 选择 GKI defconfig，armv7l 回退到 aarch64 的 gki_defconfig
-          DEFCONFIG="arch/$KARCH/configs/gki_defconfig"
-          if [ ! -f "$DEFCONFIG" ]; then
-            echo "⚠️  $DEFCONFIG not found, falling back to gki_defconfig (arm64)"
-            KARCH=arm64
-            DEFCONFIG="arch/arm64/configs/gki_defconfig"
-            echo "KARCH=$KARCH" >> $GITHUB_ENV
-          fi
+          make ARCH=$KARCH LLVM=1 mrproper
 
           # 生成 .config（轻量，不编译内核）
-          make ARCH=$KARCH gki_defconfig
+          make ARCH=$KARCH LLVM=1 gki_defconfig
 
           # 生成 Kbuild 编译外部模块所需的头文件和脚本
-          make ARCH=$KARCH modules_prepare -j$(nproc)
+          make ARCH=$KARCH LLVM=1 modules_prepare -j$(nproc)
 
           echo "Prepared kernel build env with ARCH=$KARCH"
 
@@ -120,6 +120,7 @@ jobs:
           cd kerneldriver
           make -C ../android-kernel/common \
                ARCH=$KARCH \
+               LLVM=1 \
                M=$PWD \
                modules -j$(nproc)
 
