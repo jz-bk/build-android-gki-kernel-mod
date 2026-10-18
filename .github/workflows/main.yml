@@ -95,6 +95,9 @@ jobs:
           fi
           echo "KARCH=$KARCH" >> $GITHUB_ENV
 
+          # 先清理源码树，避免残留产物导致 modules_prepare 误入 headers_install
+          make ARCH=$KARCH mrproper
+
           # 选择 GKI defconfig，armv7l 回退到 aarch64 的 gki_defconfig
           DEFCONFIG="arch/$KARCH/configs/gki_defconfig"
           if [ ! -f "$DEFCONFIG" ]; then
@@ -108,10 +111,8 @@ jobs:
           make ARCH=$KARCH gki_defconfig
 
           # 生成 Kbuild 编译外部模块所需的头文件和脚本
-          # modules_prepare 不会编译整个内核，只准备构建环境
           make ARCH=$KARCH modules_prepare -j$(nproc)
 
-          # 记录实际使用的 KARCH
           echo "Prepared kernel build env with ARCH=$KARCH"
 
       - name: Build kernel module (external module only)
