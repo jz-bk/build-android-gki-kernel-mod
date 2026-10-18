@@ -1,3 +1,30 @@
+name: Android Kernel Driver Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      android_version:
+        description: 'Android Version (Kernel)'
+        required: true
+        type: choice
+        options:
+          - common-android12-5.10
+          - common-android13-5.10
+          - common-android13-5.15
+          - common-android14-5.15
+          - common-android14-6.1
+          - common-android15-6.6
+          - common-android16-6.12
+          - common-android17-6.18
+      target_arch:
+        description: 'Target Architecture (aarch64, armv7l)'
+        required: true
+        type: choice
+        options:
+        - aarch64
+        - armv7l
+
+
 jobs:
   build:
     runs-on: ubuntu-latest
