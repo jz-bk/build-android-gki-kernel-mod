@@ -141,11 +141,14 @@ static void queue_affinity(struct task_struct *p, const struct cpumask *mask,
                            gfp_t gfp)
 {
     struct affinity_work *aw;
+    cpumask_t effective;
 
-    if (cpumask_equal(&p->cpus_mask, mask))
+    /* 把理想掩码裁剪到当前在线 CPU */
+    cpumask_and(&effective, mask, cpu_online_mask);
+
+    /* 如果任务当前掩码已经等于裁剪后的目标，不需要再设 */
+    if (cpumask_equal(&p->cpus_mask, &effective))
         return;
-    pr_info("queue: comm=%s mask=%lx curr=%lx\n",
-            p->comm, *(unsigned long *)mask, *(unsigned long *)&p->cpus_mask);
 
     aw = kmalloc(sizeof(*aw), gfp);
     if (!aw)
@@ -153,7 +156,7 @@ static void queue_affinity(struct task_struct *p, const struct cpumask *mask,
     INIT_WORK(&aw->work, affinity_work_fn);
     get_task_struct(p);
     aw->task = p;
-    cpumask_copy(&aw->mask, mask);
+    cpumask_copy(&aw->mask, &effective);   /* work 里也设裁剪后的掩码 */
     if (!queue_work(affinity_wq, &aw->work)) {
         put_task_struct(p);
         kfree(aw);
