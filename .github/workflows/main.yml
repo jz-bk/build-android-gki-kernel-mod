@@ -1,0 +1,148 @@
+name: Android Kernel Driver Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      android_version:
+        description: 'Android Version (Kernel)'
+        required: true
+        type: choice
+        options:
+          - common-android12-5.10
+          - common-android13-5.10
+          - common-android13-5.15
+          - common-android14-5.15
+          - common-android14-6.1
+          - common-android15-6.6
+          - common-android16-6.12
+          - common-android17-6.18
+      target_arch:
+        description: 'Target Architecture (aarch64, armv7l)'
+        required: true
+        type: choice
+        options:
+        - aarch64
+        - armv7l
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4.2.2
+
+      - name: Prepare kerneldriver directory
+        run: |
+          mkdir kerneldriver
+          find ./code -maxdepth 1 \( -name "*.h" -o -name "*.c" -o -name "Makefile" \) -exec cp {} kerneldriver/ \;
+
+      - name: Auto-detect driver module name
+        id: detect_module
+        run: |
+          cd kerneldriver
+          MODULE_OBJ=$(grep -E '^obj-[my]\s*[:+]?=' Makefile | head -n1 | awk '{print $3}' | sed 's/\.o$/.ko/')
+          if [ -z "$MODULE_OBJ" ]; then
+            echo "Error: Cannot find 'obj-m' or 'obj-y' in Makefile" >&2
+            exit 1
+          fi
+          echo "Detected module: $MODULE_OBJ"
+          echo "module_name=$MODULE_OBJ" >> $GITHUB_OUTPUT
+
+      - name: Install repo tool
+        run: |
+          sudo curl -L https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
+          sudo chmod a+x /usr/local/bin/repo
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python-is-python3
+
+      - name: Restore kernel source cache
+        id: cache-kernel
+        uses: actions/cache/restore@v4
+        with:
+          path: android-kernel
+          key: kernel-src-${{ github.event.inputs.android_version }}
+          restore-keys: |
+            kernel-src-${{ github.event.inputs.android_version }}
+
+      - name: Set up Android Kernel source
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p android-kernel && cd android-kernel
+          repo init -u https://android.googlesource.com/kernel/manifest -b ${{ github.event.inputs.android_version }}
+          repo sync -j$(nproc) -c --no-tags --optimized-fetch --force-sync
+
+      - name: Save kernel source cache
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: android-kernel
+          key: kernel-src-${{ github.event.inputs.android_version }}
+
+      # ===== 路径 A 核心：只做一次内核构建环境准备，不完整编译 =====
+      - name: Prepare kernel build environment (config + modules_prepare)
+        run: |
+          cd android-kernel/common
+
+          ARCH="${{ github.event.inputs.target_arch }}"
+          if [ "$ARCH" = "armv7l" ]; then
+            KARCH=arm
+          else
+            KARCH=arm64
+          fi
+          echo "KARCH=$KARCH" >> $GITHUB_ENV
+
+          # 选择 GKI defconfig，armv7l 回退到 aarch64 的 gki_defconfig
+          DEFCONFIG="arch/$KARCH/configs/gki_defconfig"
+          if [ ! -f "$DEFCONFIG" ]; then
+            echo "⚠️  $DEFCONFIG not found, falling back to gki_defconfig (arm64)"
+            KARCH=arm64
+            DEFCONFIG="arch/arm64/configs/gki_defconfig"
+            echo "KARCH=$KARCH" >> $GITHUB_ENV
+          fi
+
+          # 生成 .config（轻量，不编译内核）
+          make ARCH=$KARCH gki_defconfig
+
+          # 生成 Kbuild 编译外部模块所需的头文件和脚本
+          # modules_prepare 不会编译整个内核，只准备构建环境
+          make ARCH=$KARCH modules_prepare -j$(nproc)
+
+          # 记录实际使用的 KARCH
+          echo "Prepared kernel build env with ARCH=$KARCH"
+
+      - name: Build kernel module (external module only)
+        run: |
+          cd kerneldriver
+          make -C ../android-kernel/common \
+               ARCH=$KARCH \
+               M=$PWD \
+               modules -j$(nproc)
+
+      - name: Stage driver artifacts
+        run: |
+          mkdir -p upload_artifact
+          TARGET_MODULE="${{ steps.detect_module.outputs.module_name }}"
+          MODULE_FILE=$(find kerneldriver -maxdepth 1 -name "$TARGET_MODULE" -type f | head -1)
+
+          if [ -z "$MODULE_FILE" ]; then
+            echo "❌ Module not found! Available .ko files:"
+            find kerneldriver -name "*.ko" | head -10
+            exit 1
+          fi
+
+          echo "✅ Found module at: $MODULE_FILE"
+          cp "$MODULE_FILE" upload_artifact/
+
+          echo "📦 Staged files:"
+          ls -lh upload_artifact/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: kernel-driver-${{ github.event.inputs.target_arch }}
+          path: upload_artifact/
+          if-no-files-found: error
