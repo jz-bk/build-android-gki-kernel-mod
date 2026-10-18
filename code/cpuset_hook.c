@@ -131,24 +131,25 @@ static void affinity_work_fn(struct work_struct *work)
 
     ret = call_set_affinity(aw->task, &aw->mask);
     if (ret)
-        pr_warn("cpuset_hook_v2: set affinity pid=%d comm=%s ret=%d\n",
+        pr_warn("cpuset_hook_v3: set affinity pid=%d comm=%s ret=%d\n",
                 aw->task->pid, aw->task->comm, ret);
     put_task_struct(aw->task);
     kfree(aw);
 }
 
+/*
+ * 不去重、不限流：每次调用都 queue 一个 work。
+ * 实际 set_cpus_allowed_ptr 内部会判断掩码是否变化，没变快速返回。
+ * 掩码先和 cpu_online_mask 取交集，避免 CPU 下线时 0x7F 被裁成 0x70
+ * 后反复 queue。
+ */
 static void queue_affinity(struct task_struct *p, const struct cpumask *mask,
                            gfp_t gfp)
 {
     struct affinity_work *aw;
     cpumask_t effective;
 
-    /* 把理想掩码裁剪到当前在线 CPU */
     cpumask_and(&effective, mask, cpu_online_mask);
-
-    /* 如果任务当前掩码已经等于裁剪后的目标，不需要再设 */
-    if (cpumask_equal(&p->cpus_mask, &effective))
-        return;
 
     aw = kmalloc(sizeof(*aw), gfp);
     if (!aw)
@@ -156,7 +157,7 @@ static void queue_affinity(struct task_struct *p, const struct cpumask *mask,
     INIT_WORK(&aw->work, affinity_work_fn);
     get_task_struct(p);
     aw->task = p;
-    cpumask_copy(&aw->mask, &effective);   /* work 里也设裁剪后的掩码 */
+    cpumask_copy(&aw->mask, &effective);
     if (!queue_work(affinity_wq, &aw->work)) {
         put_task_struct(p);
         kfree(aw);
@@ -251,33 +252,33 @@ static int __init cpuset_hook_init(void)
 
     addr = my_kallsyms_lookup("set_cpus_allowed_ptr");
     if (!addr) {
-        pr_err("cpuset_hook_v2: set_cpus_allowed_ptr not found\n");
+        pr_err("cpuset_hook_v3: set_cpus_allowed_ptr not found\n");
         return -ENXIO;
     }
     set_cpus_allowed_ptr_sym = (void *)addr;
 
     g_game_uid = resolve_pkg_uid(GAME_PKG);
     if (g_game_uid == (uid_t)-1) {
-        pr_err("cpuset_hook_v2: cannot resolve UID for %s\n", GAME_PKG);
+        pr_err("cpuset_hook_v3: cannot resolve UID for %s\n", GAME_PKG);
         return -ENOENT;
     }
 
     affinity_wq = alloc_workqueue("cpuset_hook_wq", 0, 0);
     if (!affinity_wq) {
-        pr_err("cpuset_hook_v2: alloc_workqueue failed\n");
+        pr_err("cpuset_hook_v3: alloc_workqueue failed\n");
         return -ENOMEM;
     }
 
     /* Resolve and register sched_process_fork tracepoint at runtime. */
     tp_fork = find_tracepoint("sched_process_fork");
     if (!tp_fork) {
-        pr_err("cpuset_hook_v2: sched_process_fork tracepoint not found\n");
+        pr_err("cpuset_hook_v3: sched_process_fork tracepoint not found\n");
         ret = -ENOENT;
         goto err_destroy_wq;
     }
     ret = tracepoint_probe_register(tp_fork, on_sched_process_fork, NULL);
     if (ret) {
-        pr_err("cpuset_hook_v2: register sched_process_fork failed: %d\n", ret);
+        pr_err("cpuset_hook_v3: register sched_process_fork failed: %d\n", ret);
         goto err_destroy_wq;
     }
     fork_trace_registered = true;
@@ -286,7 +287,7 @@ static int __init cpuset_hook_init(void)
     ret = register_trace_android_vh_sched_setaffinity_early(
               on_sched_setaffinity_early, NULL);
     if (ret) {
-        pr_err("cpuset_hook_v2: register affinity hook failed: %d\n", ret);
+        pr_err("cpuset_hook_v3: register affinity hook failed: %d\n", ret);
         goto err_unreg_fork;
     }
     affinity_hook_registered = true;
@@ -294,18 +295,18 @@ static int __init cpuset_hook_init(void)
     /* Resolve and register task_rename tracepoint at runtime. */
     tp_rename = find_tracepoint("task_rename");
     if (!tp_rename) {
-        pr_err("cpuset_hook_v2: task_rename tracepoint not found\n");
+        pr_err("cpuset_hook_v3: task_rename tracepoint not found\n");
         ret = -ENOENT;
         goto err_unreg_affinity;
     }
     ret = tracepoint_probe_register(tp_rename, on_task_rename, NULL);
     if (ret) {
-        pr_err("cpuset_hook_v2: register task_rename failed: %d\n", ret);
+        pr_err("cpuset_hook_v3: register task_rename failed: %d\n", ret);
         goto err_unreg_affinity;
     }
     rename_trace_registered = true;
 
-    pr_info("cpuset_hook_v2: loaded package=%s uid=%u default=0x7f special=0xf0\n",
+    pr_info("cpuset_hook_v3: loaded package=%s uid=%u default=0x7f special=0xf0\n",
             GAME_PKG, g_game_uid);
     return 0;
 
@@ -341,7 +342,7 @@ static void __exit cpuset_hook_exit(void)
         destroy_workqueue(affinity_wq);
         affinity_wq = NULL;
     }
-    pr_info("cpuset_hook_v2: unloaded\n");
+    pr_info("cpuset_hook_v3: unloaded\n");
 }
 
 module_init(cpuset_hook_init);
