@@ -143,7 +143,6 @@ static int setaffinity_handler(struct kprobe *p, struct pt_regs *regs)
     struct thread_rule *r;
     const struct cpumask *mask;
     struct affinity_work *aw;
-    cpumask_t curr;
 
     rcu_read_lock();
     cred = (struct cred *)__task_cred(current);
