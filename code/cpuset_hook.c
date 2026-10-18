@@ -151,32 +151,13 @@ static int setaffinity_handler(struct kprobe *p, struct pt_regs *regs)
 
     if (uid != g_game_uid)
         return 0;
-
+    
     r = pick_rule(current->comm);
     mask = r ? &r->mask : &default_mask;
-
-    /* 已经是目标掩码，直接跳过，不碰调度器 */
-    if (cpumask_equal(&current->cpus_mask, mask)) {
-        regs->regs[0] = 0;
-        return 1;
-    }
-
-    /* 异步执行真正的绑核，避免在原子上下文操作 rq->lock */
-    aw = kmalloc(sizeof(*aw), GFP_ATOMIC);
-    if (!aw) {
-        regs->regs[0] = 0;
-        return 1;
-    }
-
-    INIT_WORK(&aw->work, affinity_work_fn);
-    get_task_struct(current);
-    aw->task = current;
-    aw->mask = *mask;
-    schedule_work(&aw->work);
-
-    /* 伪造成功返回，跳过原 sched_setaffinity */
-    regs->regs[0] = 0;
-    return 1;
+    
+    /* 只打日志，不拦截 */
+    pr_info("setaffinity: comm=%s target=%lx\n", current->comm, *(unsigned long *)mask);
+    return 0;   /* 放行原函数 */
 }
 
 /* ---------------- 模块入口 ---------------- */
