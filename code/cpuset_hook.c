@@ -52,8 +52,6 @@ static uid_t g_game_uid = (uid_t)-1;
 
 static struct kprobe kp_setaffinity;
 
-static atomic_t g_affinity_calls = ATOMIC_INIT(0);
-
 /* ---------------- 规则表 ---------------- */
 struct thread_rule {
     const char *name;
@@ -118,25 +116,6 @@ struct affinity_work {
     struct task_struct *task;
     cpumask_t mask;
 };
-
-static void affinity_work_fn(struct work_struct *work)
-{
-    struct affinity_work *aw = container_of(work, struct affinity_work, work);
-    int ret;
-
-    if (!aw->task)
-        goto out;
-
-    ret = call_set_affinity(aw->task, &aw->mask);
-    if (ret)
-        pr_err("cpuset_hook: work set affinity pid=%d ret=%d\n",
-               aw->task->pid, ret);
-
-    put_task_struct(aw->task);
-
-out:
-    kfree(aw);
-}
 
 /* ---------------- sched_setaffinity 拦截 ---------------- */
 static int setaffinity_handler(struct kprobe *p, struct pt_regs *regs)
