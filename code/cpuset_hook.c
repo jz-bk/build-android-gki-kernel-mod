@@ -4,9 +4,11 @@
  * - New threads in the target UID get a one-time default mask from fork hook.
  * - sched_setaffinity requests for the target UID are short-circuited by the
  *   Android vendor hook; a work item applies our selected mask outside hook
- *   context. No kprobe register patching and no recurring polling.
+ *   context.
+ * - task_rename tracepoint handles thread names assigned after clone.
  *
- * The task_rename tracepoint handles thread names assigned after clone.
+ * Tracepoints are resolved at runtime via for_each_kernel_tracepoint() to
+ * avoid referencing non-exported __tracepoint_* symbols on GKI kernels.
  */
 #include <linux/module.h>
 #include <linux/kprobes.h>
@@ -23,20 +25,22 @@
 #include <linux/workqueue.h>
 #include <linux/slab.h>
 #include <linux/tracepoint.h>
+#include <linux/ftrace.h>
 #include <trace/hooks/sched.h>
-#include <trace/events/sched.h>
-#include <trace/events/task.h>
 
 #define GAME_PKG "com.tencent.ig"
 
 static uid_t g_game_uid = (uid_t)-1;
 static unsigned long (*set_cpus_allowed_ptr_sym)(struct task_struct *,
                                                 const struct cpumask *);
+static struct workqueue_struct *affinity_wq;
+
 static bool fork_trace_registered;
 static bool affinity_hook_registered;
 static bool rename_trace_registered;
 
-static struct workqueue_struct *affinity_wq;
+static struct tracepoint *tp_fork;
+static struct tracepoint *tp_rename;
 
 /* Older Android kernels do not export kallsyms_lookup_name to modules. */
 static unsigned long (*kallsyms_lookup_name_sym)(const char *name);
@@ -155,7 +159,7 @@ static void queue_affinity(struct task_struct *p, const struct cpumask *mask,
 
 /* Runs for each cloned task. At this point comm can still be inherited. */
 static void on_sched_process_fork(void *ignore, struct task_struct *parent,
-                                 struct task_struct *child)
+                                  struct task_struct *child)
 {
     const struct cred *cred;
     uid_t uid;
@@ -212,13 +216,34 @@ static void on_sched_setaffinity_early(void *ignore, struct task_struct *p,
     queue_affinity(p, wanted, GFP_ATOMIC);
 }
 
+struct tp_find_ctx {
+    const char *name;
+    struct tracepoint **out;
+};
+
+static void tp_find_cb(struct tracepoint *tp, void *priv)
+{
+    struct tp_find_ctx *ctx = priv;
+
+    if (ctx->out && !*ctx->out && tp->name &&
+        !strcmp(tp->name, ctx->name))
+        *ctx->out = tp;
+}
+
+static struct tracepoint *find_tracepoint(const char *name)
+{
+    struct tracepoint *tp = NULL;
+    struct tp_find_ctx ctx = { .name = name, .out = &tp };
+
+    for_each_kernel_tracepoint(tp_find_cb, &ctx);
+    return tp;
+}
+
 static int __init cpuset_hook_init(void)
 {
     unsigned long addr;
     int ret;
 
-    /* Resolve the internal scheduler helper through kallsyms lookup exposed
-     * by this build's existing DDK environment. */
     addr = my_kallsyms_lookup("set_cpus_allowed_ptr");
     if (!addr) {
         pr_err("cpuset_hook_v2: set_cpus_allowed_ptr not found\n");
@@ -232,59 +257,83 @@ static int __init cpuset_hook_init(void)
         return -ENOENT;
     }
 
-    /* 创建私有工作队列，放在注册 trace 之前 */
     affinity_wq = alloc_workqueue("cpuset_hook_wq", 0, 0);
     if (!affinity_wq) {
         pr_err("cpuset_hook_v2: alloc_workqueue failed\n");
         return -ENOMEM;
     }
-  
-    ret = register_trace_sched_process_fork(on_sched_process_fork, NULL);
+
+    /* Resolve and register sched_process_fork tracepoint at runtime. */
+    tp_fork = find_tracepoint("sched_process_fork");
+    if (!tp_fork) {
+        pr_err("cpuset_hook_v2: sched_process_fork tracepoint not found\n");
+        ret = -ENOENT;
+        goto err_destroy_wq;
+    }
+    ret = tracepoint_probe_register(tp_fork, on_sched_process_fork, NULL);
     if (ret) {
         pr_err("cpuset_hook_v2: register sched_process_fork failed: %d\n", ret);
-        return ret;
+        goto err_destroy_wq;
     }
     fork_trace_registered = true;
 
+    /* Android vendor hook for sched_setaffinity_early. */
     ret = register_trace_android_vh_sched_setaffinity_early(
               on_sched_setaffinity_early, NULL);
     if (ret) {
         pr_err("cpuset_hook_v2: register affinity hook failed: %d\n", ret);
-        unregister_trace_sched_process_fork(on_sched_process_fork, NULL);
-        fork_trace_registered = false;
-        return ret;
+        goto err_unreg_fork;
     }
     affinity_hook_registered = true;
 
-    ret = register_trace_task_rename(on_task_rename, NULL);
+    /* Resolve and register task_rename tracepoint at runtime. */
+    tp_rename = find_tracepoint("task_rename");
+    if (!tp_rename) {
+        pr_err("cpuset_hook_v2: task_rename tracepoint not found\n");
+        ret = -ENOENT;
+        goto err_unreg_affinity;
+    }
+    ret = tracepoint_probe_register(tp_rename, on_task_rename, NULL);
     if (ret) {
         pr_err("cpuset_hook_v2: register task_rename failed: %d\n", ret);
-        unregister_trace_android_vh_sched_setaffinity_early(
-            on_sched_setaffinity_early, NULL);
-        affinity_hook_registered = false;
-        unregister_trace_sched_process_fork(on_sched_process_fork, NULL);
-        fork_trace_registered = false;
-        return ret;
+        goto err_unreg_affinity;
     }
     rename_trace_registered = true;
 
     pr_info("cpuset_hook_v2: loaded package=%s uid=%u default=0x7f special=0xf0\n",
             GAME_PKG, g_game_uid);
     return 0;
+
+err_unreg_affinity:
+    unregister_trace_android_vh_sched_setaffinity_early(
+        on_sched_setaffinity_early, NULL);
+    affinity_hook_registered = false;
+err_unreg_fork:
+    tracepoint_probe_unregister(tp_fork, on_sched_process_fork, NULL);
+    fork_trace_registered = false;
+err_destroy_wq:
+    destroy_workqueue(affinity_wq);
+    affinity_wq = NULL;
+    return ret;
 }
 
 static void __exit cpuset_hook_exit(void)
 {
-    if (rename_trace_registered)
-        unregister_trace_task_rename(on_task_rename, NULL);
+    if (rename_trace_registered && tp_rename)
+        tracepoint_probe_unregister(tp_rename, on_task_rename, NULL);
+    rename_trace_registered = false;
+
     if (affinity_hook_registered)
         unregister_trace_android_vh_sched_setaffinity_early(
             on_sched_setaffinity_early, NULL);
-    if (fork_trace_registered)
-        unregister_trace_sched_process_fork(on_sched_process_fork, NULL);
+    affinity_hook_registered = false;
+
+    if (fork_trace_registered && tp_fork)
+        tracepoint_probe_unregister(tp_fork, on_sched_process_fork, NULL);
+    fork_trace_registered = false;
 
     if (affinity_wq) {
-        destroy_workqueue(affinity_wq);   /* 内部会 flush 并等待所有已排队工作完成 */
+        destroy_workqueue(affinity_wq);
         affinity_wq = NULL;
     }
     pr_info("cpuset_hook_v2: unloaded\n");
