@@ -215,7 +215,6 @@ static int __init cpuset_hook_init(void)
 static void __exit cpuset_hook_exit(void)
 {
     unregister_kprobe(&kp_setaffinity);
-    flush_scheduled_work();
     pr_info("cpuset_hook: unloaded\n");
 }
 
