@@ -102,12 +102,38 @@ static uid_t resolve_pkg_uid(const char *pkg)
     return uid;
 }
 
+/* ---------------- CFI 豁免的间接调用 ---------------- */
+static int call_set_affinity(struct task_struct *t, const struct cpumask *m)
+    __nocfi
+{
+    return set_cpus_allowed_ptr_sym(t, m);
+}
+
 /* ---------------- workqueue 异步绑核 ---------------- */
 struct affinity_work {
     struct work_struct work;
     struct task_struct *task;
     cpumask_t mask;
 };
+
+static void affinity_work_fn(struct work_struct *work)
+{
+    struct affinity_work *aw = container_of(work, struct affinity_work, work);
+    int ret;
+
+    if (!aw->task)
+        goto out;
+
+    ret = call_set_affinity(aw->task, &aw->mask);
+    if (ret)
+        pr_err("cpuset_hook: work set affinity pid=%d ret=%d\n",
+               aw->task->pid, ret);
+
+    put_task_struct(aw->task);
+
+out:
+    kfree(aw);
+}
 
 /* ---------------- sched_setaffinity 拦截 ---------------- */
 static int setaffinity_handler(struct kprobe *p, struct pt_regs *regs)
@@ -116,6 +142,7 @@ static int setaffinity_handler(struct kprobe *p, struct pt_regs *regs)
     uid_t uid;
     struct thread_rule *r;
     const struct cpumask *mask;
+    struct affinity_work *aw;
 
     rcu_read_lock();
     cred = (struct cred *)__task_cred(current);
@@ -124,13 +151,26 @@ static int setaffinity_handler(struct kprobe *p, struct pt_regs *regs)
 
     if (uid != g_game_uid)
         return 0;
-    
+
     r = pick_rule(current->comm);
     mask = r ? &r->mask : &default_mask;
-    
-    /* 只打日志，不拦截 */
-    pr_info("setaffinity: comm=%s target=%lx\n", current->comm, *(unsigned long *)mask);
-    return 0;   /* 放行原函数 */
+
+    /* 如果当前掩码已经是目标值，不用管 */
+    if (cpumask_equal(&current->cpus_mask, mask))
+        return 0;   /* 放行原函数 */
+
+    /* 异步纠正：扔进 workqueue，稍后改回来 */
+    aw = kmalloc(sizeof(*aw), GFP_ATOMIC);
+    if (!aw)
+        return 0;
+
+    INIT_WORK(&aw->work, affinity_work_fn);
+    get_task_struct(current);
+    aw->task = current;
+    aw->mask = *mask;
+    schedule_work(&aw->work);
+
+    return 0;   /* 放行原函数，游戏正常返回 */
 }
 
 /* ---------------- 模块入口 ---------------- */
