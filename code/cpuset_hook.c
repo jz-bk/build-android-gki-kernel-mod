@@ -8,20 +8,21 @@
  *   all other threads of target UID                     -> CPU 0-6 (0x7F)
  *
  * Mechanics (bind and hook are independent):
- *   - sched_process_fork: new target-UID thread gets default 0x7F (CPU 0-6).
+ *   - sched_process_fork: new target-UID thread gets default 0x7F (CPU 0-6),
+ *     or the matching rule mask if comm already matches at fork time.
  *   - task_rename: if new comm matches a rule, apply rule mask; otherwise
  *     fall back to 0x7F.
  *   - sched_setaffinity_early (Android vendor hook): every request from the
  *     target UID is rejected (skip=true). The hook does NOT reapply masks;
  *     binding is done only by fork/rename.
  *
- * Why fork/rename still use a workqueue:
- *   - task_rename tracepoint runs under task_lock(p), and
- *     set_cpus_allowed_ptr() may sleep (stop_one_cpu / migrate_swap).
- *   - fork is queued for symmetry and to keep tracepoint path allocation-only.
+ * Diagnostics:
+ *   - kprobe on set_cpus_allowed_ptr entry logs every external caller
+ *     (perfmgr, cpuset_attach, sched_setattr, mali, ...) that targets the
+ *     game UID, so we can see who overrides our mask.
  *
- * Tracepoints resolved at runtime via for_each_kernel_tracepoint() to avoid
- * referencing non-exported __tracepoint_* symbols on GKI kernels.
+ * Tracepoints are resolved at runtime via for_each_kernel_tracepoint() to
+ * avoid referencing non-exported __tracepoint_* symbols on GKI kernels.
  */
 #include <linux/module.h>
 #include <linux/kprobes.h>
@@ -40,12 +41,9 @@
 #include <linux/tracepoint.h>
 #include <linux/ftrace.h>
 #include <linux/atomic.h>
+#include <linux/module.h>
 #include <trace/hooks/sched.h>
-#include <linux/bitmap.h>
 
-/* 打印 cpumask 为 "0-6" / "4-7" 这种形式，比 %lx 直观，且不受 NR_CPUS 影响 */
-#define MASK_FMT "%*pbl"
-#define MASK_ARG(m) cpumask_pr_args(m)
 #define GAME_PKG "com.tencent.ig"
 
 static uid_t g_game_uid = (uid_t)-1;
@@ -67,6 +65,7 @@ static atomic64_t cnt_hook_skip;
 static atomic64_t cnt_work_ok;
 static atomic64_t cnt_work_fail;
 static atomic64_t cnt_drop;
+static atomic64_t cnt_kprobe_ext;
 
 /* kallsyms lookup via kprobe, for kernels that don't export it. */
 static unsigned long (*kallsyms_lookup_name_sym)(const char *name);
@@ -175,19 +174,19 @@ static void affinity_work_fn(struct work_struct *work)
     ret = call_set_affinity(aw->task, &aw->mask);
     if (ret) {
         atomic64_inc(&cnt_work_fail);
-        pr_warn("cpuset_hook_v3: work FAIL pid=%d comm=%s want=" MASK_FMT
-                " ret=%d now=" MASK_FMT "\n",
+        pr_warn("cpuset_hook_v3: work FAIL pid=%d comm=%s want=%*pbl "
+                "ret=%d now=%*pbl\n",
                 aw->task->pid, aw->task->comm,
-                MASK_ARG(&aw->mask), ret,
-                MASK_ARG(&aw->task->cpus_mask));
+                cpumask_pr_args(&aw->mask), ret,
+                cpumask_pr_args(&aw->task->cpus_mask));
     } else {
         atomic64_inc(&cnt_work_ok);
-        /* 成功也打：对比 want 和 now，若不等说明内核/厂商改写了掩码 */
-        pr_info_ratelimited("cpuset_hook_v3: work OK pid=%d comm=%s want=" MASK_FMT
-                            " now=" MASK_FMT "%s\n",
+        /* Success also logged: compare want vs now to catch external override. */
+        pr_info_ratelimited("cpuset_hook_v3: work OK pid=%d comm=%s want=%*pbl "
+                            "now=%*pbl%s\n",
                             aw->task->pid, aw->task->comm,
-                            MASK_ARG(&aw->mask),
-                            MASK_ARG(&aw->task->cpus_mask),
+                            cpumask_pr_args(&aw->mask),
+                            cpumask_pr_args(&aw->task->cpus_mask),
                             cpumask_equal(&aw->task->cpus_mask, &aw->mask)
                                 ? "" : "  <-- MISMATCH!");
     }
@@ -218,11 +217,18 @@ static void queue_affinity(struct task_struct *p, const struct cpumask *mask,
     }
 }
 
+/*
+ * fork: child inherits parent's comm. If comm already matches a rule, apply
+ * the rule mask; otherwise apply default 0x7F. This fixes the case where a
+ * thread is forked with its final name (e.g. UEGameThread) and never calls
+ * task_rename, which previously left it at default forever.
+ */
 static void on_sched_process_fork(void *ignore, struct task_struct *parent,
                                   struct task_struct *child)
 {
     const struct cred *cred;
     uid_t uid;
+    struct thread_rule *r;
 
     rcu_read_lock();
     cred = __task_cred(child);
@@ -231,13 +237,19 @@ static void on_sched_process_fork(void *ignore, struct task_struct *parent,
     if (uid != g_game_uid)
         return;
 
-    queue_affinity(child, &default_mask, GFP_ATOMIC);
+    r = pick_rule(child->comm);
+    queue_affinity(child, r ? &r->mask : &default_mask, GFP_ATOMIC);
     atomic64_inc(&cnt_fork);
-    pr_info_ratelimited("cpuset_hook_v3: fork pid=%d comm=%s -> default="
-                        MASK_FMT "\n",
-                        child->pid, child->comm, MASK_ARG(&default_mask));
+    pr_info_ratelimited("cpuset_hook_v3: fork pid=%d comm=%s rule=%s mask=%*pbl\n",
+                        child->pid, child->comm,
+                        r ? r->name : "(none)",
+                        cpumask_pr_args(r ? &r->mask : &default_mask));
 }
 
+/*
+ * rename: apply the named rule if matched; fall back to default 0x7F
+ * otherwise. A thread renamed away from a special name is demoted to 0-6.
+ */
 static void on_task_rename(void *ignore, struct task_struct *p,
                            const char *newcomm)
 {
@@ -256,10 +268,10 @@ static void on_task_rename(void *ignore, struct task_struct *p,
     queue_affinity(p, r ? &r->mask : &default_mask, GFP_ATOMIC);
     atomic64_inc(&cnt_rename);
     pr_info_ratelimited("cpuset_hook_v3: rename pid=%d newcomm='%s' rule=%s "
-                        "mask=" MASK_FMT "\n",
+                        "mask=%*pbl\n",
                         p->pid, newcomm,
                         r ? r->name : "(none)",
-                        MASK_ARG(r ? &r->mask : &default_mask));
+                        cpumask_pr_args(r ? &r->mask : &default_mask));
 }
 
 /*
@@ -282,16 +294,56 @@ static void on_sched_setaffinity_early(void *ignore, struct task_struct *p,
 
     *skip = true;
     atomic64_inc(&cnt_hook_skip);
+    pr_info_ratelimited("cpuset_hook_v3: hook pid=%d comm=%s want=%*pbl "
+                        "skip=true\n",
+                        p->pid, p->comm, cpumask_pr_args(new_mask));
+}
 
-    /* 前 50 次无条件打，之后限流；确认 hook 语义和游戏意图 */
-    if (atomic64_read(&cnt_hook_skip) <= 50)
-        pr_info("cpuset_hook_v3: hook pid=%d comm=%s want=" MASK_FMT
-                " skip=true\n",
-                p->pid, p->comm, MASK_ARG(new_mask));
-    else
-        pr_info_ratelimited("cpuset_hook_v3: hook pid=%d comm=%s want=" MASK_FMT
-                            " skip=true\n",
-                            p->pid, p->comm, MASK_ARG(new_mask));
+/*
+ * kprobe on set_cpus_allowed_ptr entry. Logs every external caller that
+ * targets the game UID, so we can identify who overrides our mask
+ * (perfmgr kthread, cpuset_attach, sched_setattr, mali, ...).
+ *
+ * x86_64: arg0 = di, arg1 = si
+ * arm64:  arg0 = regs[0], arg1 = regs[1]
+ */
+static struct kprobe set_affinity_kp;
+static bool set_affinity_kp_registered;
+
+static int set_affinity_pre(struct kprobe *p, struct pt_regs *regs)
+{
+#if defined(CONFIG_X86_64)
+    struct task_struct *task = (struct task_struct *)regs->di;
+    const struct cpumask *mask = (const struct cpumask *)regs->si;
+#elif defined(CONFIG_ARM64)
+    struct task_struct *task = (struct task_struct *)regs->regs[0];
+    const struct cpumask *mask = (const struct cpumask *)regs->regs[1];
+#else
+#error "unsupported arch"
+#endif
+    const struct cred *cred;
+    uid_t uid;
+
+    if (!task || !mask)
+        return 0;
+
+    rcu_read_lock();
+    cred = __task_cred(task);
+    uid = __kuid_val(cred->uid);
+    rcu_read_unlock();
+    if (uid != g_game_uid)
+        return 0;
+
+    /* Skip our own work's call site; only log external callers. */
+    if (within_module(regs->ip, THIS_MODULE))
+        return 0;
+
+    atomic64_inc(&cnt_kprobe_ext);
+    pr_info_ratelimited("cpuset_hook_v3: EXTERNAL set_affinity pid=%d "
+                        "comm=%s want=%*pbl caller=%pS\n",
+                        task->pid, task->comm, cpumask_pr_args(mask),
+                        (void *)regs->ip);
+    return 0;
 }
 
 struct tp_find_ctx {
@@ -343,17 +395,29 @@ static int __init cpuset_hook_init(void)
         return -ENOMEM;
     }
 
+    /* Diagnostic kprobe. Non-fatal if it fails. */
+    set_affinity_kp.symbol_name = "set_cpus_allowed_ptr";
+    set_affinity_kp.pre_handler = set_affinity_pre;
+    ret = register_kprobe(&set_affinity_kp);
+    if (ret) {
+        pr_err("cpuset_hook_v3: register kprobe failed: %d\n", ret);
+    } else {
+        set_affinity_kp_registered = true;
+        pr_info("cpuset_hook_v3: kprobe on set_cpus_allowed_ptr at %px\n",
+                set_affinity_kp.addr);
+    }
+
     tp_fork = find_tracepoint("sched_process_fork");
     if (!tp_fork) {
         pr_err("cpuset_hook_v3: sched_process_fork tracepoint not found\n");
         ret = -ENOENT;
-        goto err_destroy_wq;
+        goto err_unreg_kprobe;
     }
     ret = tracepoint_probe_register(tp_fork, on_sched_process_fork, NULL);
     if (ret) {
         pr_err("cpuset_hook_v3: register sched_process_fork failed: %d\n",
                ret);
-        goto err_destroy_wq;
+        goto err_unreg_kprobe;
     }
     fork_trace_registered = true;
 
@@ -378,9 +442,10 @@ static int __init cpuset_hook_init(void)
     }
     rename_trace_registered = true;
 
-    pr_info("cpuset_hook_v3: loaded pkg=%s uid=%u default=0x7f named=0xf0 "
-            "rules=%zu hook=deny-all\n",
-            GAME_PKG, g_game_uid, ARRAY_SIZE(rules));
+    pr_info("cpuset_hook_v3: loaded pkg=%s uid=%u default=%*pbl named=4-7 "
+            "rules=%zu hook=deny-all set_cpus_allowed_ptr=%px\n",
+            GAME_PKG, g_game_uid, cpumask_pr_args(&default_mask),
+            ARRAY_SIZE(rules), (void *)set_cpus_allowed_ptr_sym);
     return 0;
 
 err_unreg_affinity:
@@ -390,7 +455,11 @@ err_unreg_affinity:
 err_unreg_fork:
     tracepoint_probe_unregister(tp_fork, on_sched_process_fork, NULL);
     fork_trace_registered = false;
-err_destroy_wq:
+err_unreg_kprobe:
+    if (set_affinity_kp_registered) {
+        unregister_kprobe(&set_affinity_kp);
+        set_affinity_kp_registered = false;
+    }
     destroy_workqueue(affinity_wq);
     affinity_wq = NULL;
     return ret;
@@ -411,19 +480,25 @@ static void __exit cpuset_hook_exit(void)
         tracepoint_probe_unregister(tp_fork, on_sched_process_fork, NULL);
     fork_trace_registered = false;
 
+    if (set_affinity_kp_registered) {
+        unregister_kprobe(&set_affinity_kp);
+        set_affinity_kp_registered = false;
+    }
+
     if (affinity_wq) {
         destroy_workqueue(affinity_wq);
         affinity_wq = NULL;
     }
 
     pr_info("cpuset_hook_v3: unloaded (fork=%lld rename=%lld hook_skip=%lld "
-            "work_ok=%lld work_fail=%lld drop=%lld)\n",
+            "work_ok=%lld work_fail=%lld drop=%lld kprobe_ext=%lld)\n",
             (long long)atomic64_read(&cnt_fork),
             (long long)atomic64_read(&cnt_rename),
             (long long)atomic64_read(&cnt_hook_skip),
             (long long)atomic64_read(&cnt_work_ok),
             (long long)atomic64_read(&cnt_work_fail),
-            (long long)atomic64_read(&cnt_drop));
+            (long long)atomic64_read(&cnt_drop),
+            (long long)atomic64_read(&cnt_kprobe_ext));
 }
 
 module_init(cpuset_hook_init);
