@@ -1,14 +1,27 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Android 15 / 6.6: game affinity policy.
- * - New threads in the target UID get a one-time default mask from fork hook.
- * - sched_setaffinity requests for the target UID are short-circuited by the
- *   Android vendor hook; a work item applies our selected mask outside hook
- *   context.
- * - task_rename tracepoint handles thread names assigned after clone.
+ * Android 15 / 6.6: PUBG (com.tencent.ig) CPU affinity policy.
  *
- * Tracepoints are resolved at runtime via for_each_kernel_tracepoint() to
- * avoid referencing non-exported __tracepoint_* symbols on GKI kernels.
+ * Policy (hard-coded, mirrors config.conf spec):
+ *   UEGameThread*, RHIThread, RenderThread*, TaskGraphNP*,
+ *   mali-event-hand*, mali-cpu-comman*, NativeThread*  -> CPU 4-7 (0xF0)
+ *   all other threads of target UID                     -> CPU 0-6 (0x7F)
+ *
+ * Mechanics (bind and hook are independent):
+ *   - sched_process_fork: new target-UID thread gets default 0x7F (CPU 0-6).
+ *   - task_rename: if new comm matches a rule, apply rule mask; otherwise
+ *     fall back to 0x7F.
+ *   - sched_setaffinity_early (Android vendor hook): every request from the
+ *     target UID is rejected (skip=true). The hook does NOT reapply masks;
+ *     binding is done only by fork/rename.
+ *
+ * Why fork/rename still use a workqueue:
+ *   - task_rename tracepoint runs under task_lock(p), and
+ *     set_cpus_allowed_ptr() may sleep (stop_one_cpu / migrate_swap).
+ *   - fork is queued for symmetry and to keep tracepoint path allocation-only.
+ *
+ * Tracepoints resolved at runtime via for_each_kernel_tracepoint() to avoid
+ * referencing non-exported __tracepoint_* symbols on GKI kernels.
  */
 #include <linux/module.h>
 #include <linux/kprobes.h>
@@ -26,6 +39,7 @@
 #include <linux/slab.h>
 #include <linux/tracepoint.h>
 #include <linux/ftrace.h>
+#include <linux/atomic.h>
 #include <trace/hooks/sched.h>
 
 #define GAME_PKG "com.tencent.ig"
@@ -42,7 +56,15 @@ static bool rename_trace_registered;
 static struct tracepoint *tp_fork;
 static struct tracepoint *tp_rename;
 
-/* Older Android kernels do not export kallsyms_lookup_name to modules. */
+/* Counters, dumped on unload via dmesg. */
+static atomic64_t cnt_fork;
+static atomic64_t cnt_rename;
+static atomic64_t cnt_hook_skip;
+static atomic64_t cnt_work_ok;
+static atomic64_t cnt_work_fail;
+static atomic64_t cnt_drop;
+
+/* kallsyms lookup via kprobe, for kernels that don't export it. */
 static unsigned long (*kallsyms_lookup_name_sym)(const char *name);
 static int dummy_pre(struct kprobe *p, struct pt_regs *regs) { return 0; }
 static unsigned long get_kallsyms_addr(void)
@@ -65,18 +87,39 @@ static unsigned long my_kallsyms_lookup(const char *name)
     return kallsyms_lookup_name_sym(name);
 }
 
-struct thread_rule { const char *name; cpumask_t mask; };
-static struct thread_rule rules[] = {
-    { "UEGameThread",    { .bits = { 0xF0 } } },
-    { "RHIThread",       { .bits = { 0xF0 } } },
-    { "RenderThread",    { .bits = { 0xF0 } } },
-    { "TaskGraphNP",     { .bits = { 0xF0 } } },
-    { "mali-event-hand", { .bits = { 0xF0 } } },
-    { "mali-cpu-comman", { .bits = { 0xF0 } } },
-    { "NativeThread",    { .bits = { 0xF0 } } },
+/*
+ * Rule table. prefix=true means config "*" (prefix match), false means
+ * exact match. All named rules target CPU 4-7 (mask 0xF0).
+ */
+struct thread_rule {
+    const char *name;
+    cpumask_t mask;
+    bool prefix;
 };
+
+static struct thread_rule rules[] = {
+    { "UEGameThread",    { .bits = { 0xF0 } }, true  },
+    { "RHIThread",       { .bits = { 0xF0 } }, false },
+    { "RenderThread",    { .bits = { 0xF0 } }, true  },
+    { "TaskGraphNP",     { .bits = { 0xF0 } }, true  },
+    { "mali-event-hand", { .bits = { 0xF0 } }, true  },
+    { "mali-cpu-comman", { .bits = { 0xF0 } }, true  },
+    { "NativeThread",    { .bits = { 0xF0 } }, true  },
+};
+
+/* Everything else in target UID: CPU 0-6 (CPU7 reserved for named rules). */
 static const cpumask_t default_mask = { .bits = { 0x7F } };
 
+static bool rule_matches(const struct thread_rule *r, const char *comm)
+{
+    if (r->prefix) {
+        size_t len = strlen(r->name);
+        return strncmp(comm, r->name, len) == 0;
+    }
+    return strcmp(comm, r->name) == 0;
+}
+
+/* Longest match wins, so e.g. "RenderThread" beats a shorter prefix. */
 static struct thread_rule *pick_rule(const char *comm)
 {
     struct thread_rule *best = NULL;
@@ -85,18 +128,12 @@ static struct thread_rule *pick_rule(const char *comm)
 
     for (i = 0; i < ARRAY_SIZE(rules); i++) {
         size_t len = strlen(rules[i].name);
-        if (strncmp(comm, rules[i].name, len) == 0 && len > best_len) {
+        if (rule_matches(&rules[i], comm) && len > best_len) {
             best = &rules[i];
             best_len = len;
         }
     }
     return best;
-}
-
-static const struct cpumask *mask_for_task(struct task_struct *p)
-{
-    struct thread_rule *r = pick_rule(p->comm);
-    return r ? &r->mask : &default_mask;
 }
 
 static uid_t resolve_pkg_uid(const char *pkg)
@@ -107,13 +144,15 @@ static uid_t resolve_pkg_uid(const char *pkg)
 
     snprintf(path, sizeof(path), "/data/data/%s", pkg);
     if (kern_path(path, LOOKUP_FOLLOW, &p) == 0) {
-        uid = __kuid_val(d_inode(p.dentry)->i_uid);
+        if (d_inode(p.dentry))
+            uid = __kuid_val(d_inode(p.dentry)->i_uid);
         path_put(&p);
     }
     return uid;
 }
 
-static int call_set_affinity(struct task_struct *p, const struct cpumask *mask) __nocfi
+static int call_set_affinity(struct task_struct *p,
+                             const struct cpumask *mask) __nocfi
 {
     return set_cpus_allowed_ptr_sym(p, mask);
 }
@@ -130,41 +169,45 @@ static void affinity_work_fn(struct work_struct *work)
     int ret;
 
     ret = call_set_affinity(aw->task, &aw->mask);
-    if (ret)
+    if (ret) {
+        atomic64_inc(&cnt_work_fail);
         pr_warn("cpuset_hook_v3: set affinity pid=%d comm=%s ret=%d\n",
                 aw->task->pid, aw->task->comm, ret);
+    } else {
+        atomic64_inc(&cnt_work_ok);
+    }
     put_task_struct(aw->task);
     kfree(aw);
 }
 
-/*
- * 不去重、不限流：每次调用都 queue 一个 work。
- * 实际 set_cpus_allowed_ptr 内部会判断掩码是否变化，没变快速返回。
- * 掩码先和 cpu_online_mask 取交集，避免 CPU 下线时 0x7F 被裁成 0x70
- * 后反复 queue。
- */
 static void queue_affinity(struct task_struct *p, const struct cpumask *mask,
                            gfp_t gfp)
 {
     struct affinity_work *aw;
-    cpumask_t effective;
 
-    cpumask_and(&effective, mask, cpu_online_mask);
-
-    aw = kmalloc(sizeof(*aw), gfp);
-    if (!aw)
+    if (cpumask_equal(&p->cpus_mask, mask))
         return;
+    aw = kmalloc(sizeof(*aw), gfp);
+    if (!aw) {
+        atomic64_inc(&cnt_drop);
+        return;
+    }
     INIT_WORK(&aw->work, affinity_work_fn);
     get_task_struct(p);
     aw->task = p;
-    cpumask_copy(&aw->mask, &effective);
+    cpumask_copy(&aw->mask, mask);
     if (!queue_work(affinity_wq, &aw->work)) {
+        atomic64_inc(&cnt_drop);
         put_task_struct(p);
         kfree(aw);
     }
 }
 
-/* Runs for each cloned task. At this point comm can still be inherited. */
+/*
+ * fork: child inherits parent's comm at this point, so we cannot apply
+ * named rules here. Apply default 0x7F; task_rename will promote named
+ * threads to 0xF0 once they get their final comm.
+ */
 static void on_sched_process_fork(void *ignore, struct task_struct *parent,
                                   struct task_struct *child)
 {
@@ -178,10 +221,14 @@ static void on_sched_process_fork(void *ignore, struct task_struct *parent,
     if (uid != g_game_uid)
         return;
 
-    queue_affinity(child, mask_for_task(child), GFP_ATOMIC);
+    queue_affinity(child, &default_mask, GFP_ATOMIC);
+    atomic64_inc(&cnt_fork);
 }
 
-/* Thread names are commonly assigned after clone; apply the named rule then. */
+/*
+ * rename: apply the named rule if matched; fall back to default 0x7F
+ * otherwise. A thread renamed away from a special name is demoted to 0-6.
+ */
 static void on_task_rename(void *ignore, struct task_struct *p,
                            const char *newcomm)
 {
@@ -198,16 +245,21 @@ static void on_task_rename(void *ignore, struct task_struct *p,
 
     r = pick_rule(newcomm);
     queue_affinity(p, r ? &r->mask : &default_mask, GFP_ATOMIC);
+    atomic64_inc(&cnt_rename);
 }
 
-/* Android 15-6.6 hook: bool *skip; true returns success without changing mask. */
+/*
+ * Android vendor hook: reject every sched_setaffinity request from the
+ * target UID. No mask is applied here; binding is done by fork/rename.
+ */
 static void on_sched_setaffinity_early(void *ignore, struct task_struct *p,
                                        const struct cpumask *new_mask,
                                        bool *skip)
 {
     const struct cred *cred;
     uid_t uid;
-    const struct cpumask *wanted;
+
+    (void)new_mask;
 
     rcu_read_lock();
     cred = __task_cred(p);
@@ -216,10 +268,8 @@ static void on_sched_setaffinity_early(void *ignore, struct task_struct *p,
     if (uid != g_game_uid)
         return;
 
-    wanted = mask_for_task(p);
-    /* Never let the game's requested mask replace the enforced policy. */
     *skip = true;
-    queue_affinity(p, wanted, GFP_ATOMIC);
+    atomic64_inc(&cnt_hook_skip);
 }
 
 struct tp_find_ctx {
@@ -263,13 +313,14 @@ static int __init cpuset_hook_init(void)
         return -ENOENT;
     }
 
-    affinity_wq = alloc_workqueue("cpuset_hook_wq", 0, 0);
+    /* max_active=4: bounded to avoid a startup fork/rename storm flooding
+     * the queue with GFP_ATOMIC allocations. Failures are counted. */
+    affinity_wq = alloc_workqueue("cpuset_hook_wq", 0, 4);
     if (!affinity_wq) {
         pr_err("cpuset_hook_v3: alloc_workqueue failed\n");
         return -ENOMEM;
     }
 
-    /* Resolve and register sched_process_fork tracepoint at runtime. */
     tp_fork = find_tracepoint("sched_process_fork");
     if (!tp_fork) {
         pr_err("cpuset_hook_v3: sched_process_fork tracepoint not found\n");
@@ -278,12 +329,12 @@ static int __init cpuset_hook_init(void)
     }
     ret = tracepoint_probe_register(tp_fork, on_sched_process_fork, NULL);
     if (ret) {
-        pr_err("cpuset_hook_v3: register sched_process_fork failed: %d\n", ret);
+        pr_err("cpuset_hook_v3: register sched_process_fork failed: %d\n",
+               ret);
         goto err_destroy_wq;
     }
     fork_trace_registered = true;
 
-    /* Android vendor hook for sched_setaffinity_early. */
     ret = register_trace_android_vh_sched_setaffinity_early(
               on_sched_setaffinity_early, NULL);
     if (ret) {
@@ -292,7 +343,6 @@ static int __init cpuset_hook_init(void)
     }
     affinity_hook_registered = true;
 
-    /* Resolve and register task_rename tracepoint at runtime. */
     tp_rename = find_tracepoint("task_rename");
     if (!tp_rename) {
         pr_err("cpuset_hook_v3: task_rename tracepoint not found\n");
@@ -306,8 +356,9 @@ static int __init cpuset_hook_init(void)
     }
     rename_trace_registered = true;
 
-    pr_info("cpuset_hook_v3: loaded package=%s uid=%u default=0x7f special=0xf0\n",
-            GAME_PKG, g_game_uid);
+    pr_info("cpuset_hook_v3: loaded pkg=%s uid=%u default=0x7f named=0xf0 "
+            "rules=%zu hook=deny-all\n",
+            GAME_PKG, g_game_uid, ARRAY_SIZE(rules));
     return 0;
 
 err_unreg_affinity:
@@ -342,7 +393,15 @@ static void __exit cpuset_hook_exit(void)
         destroy_workqueue(affinity_wq);
         affinity_wq = NULL;
     }
-    pr_info("cpuset_hook_v3: unloaded\n");
+
+    pr_info("cpuset_hook_v3: unloaded (fork=%lld rename=%lld hook_skip=%lld "
+            "work_ok=%lld work_fail=%lld drop=%lld)\n",
+            (long long)atomic64_read(&cnt_fork),
+            (long long)atomic64_read(&cnt_rename),
+            (long long)atomic64_read(&cnt_hook_skip),
+            (long long)atomic64_read(&cnt_work_ok),
+            (long long)atomic64_read(&cnt_work_fail),
+            (long long)atomic64_read(&cnt_drop));
 }
 
 module_init(cpuset_hook_init);
