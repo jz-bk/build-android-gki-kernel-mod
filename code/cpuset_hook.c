@@ -144,6 +144,9 @@ static void queue_affinity(struct task_struct *p, const struct cpumask *mask,
 
     if (cpumask_equal(&p->cpus_mask, mask))
         return;
+    pr_info("queue: comm=%s mask=%lx curr=%lx\n",
+            p->comm, *(unsigned long *)mask, *(unsigned long *)&p->cpus_mask);
+
     aw = kmalloc(sizeof(*aw), gfp);
     if (!aw)
         return;
@@ -171,8 +174,7 @@ static void on_sched_process_fork(void *ignore, struct task_struct *parent,
     if (uid != g_game_uid)
         return;
 
-    /* Initial per-thread binding. task_rename corrects named rules later. */
-    queue_affinity(child, &default_mask, GFP_ATOMIC);
+    queue_affinity(child, mask_for_task(child), GFP_ATOMIC);
 }
 
 /* Thread names are commonly assigned after clone; apply the named rule then. */
