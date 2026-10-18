@@ -24,13 +24,9 @@ on:
         - aarch64
         - armv7l
 
-
 jobs:
   build:
     runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/ylarod/ddk:${{ github.event.inputs.android_version }}-20251016
-      options: --privileged
 
     steps:
       - name: Checkout repository
@@ -38,7 +34,7 @@ jobs:
 
       - name: Prepare kerneldriver directory
         run: |
-          mkdir -p kerneldriver
+          mkdir kerneldriver
           find ./code -maxdepth 1 \( -name "*.h" -o -name "*.c" -o -name "Makefile" \) -exec cp {} kerneldriver/ \;
 
       - name: Auto-detect driver module name
@@ -47,28 +43,95 @@ jobs:
           cd kerneldriver
           MODULE_OBJ=$(grep -E '^obj-[my]\s*[:+]?=' Makefile | head -n1 | awk '{print $3}' | sed 's/\.o$/.ko/')
           if [ -z "$MODULE_OBJ" ]; then
-            echo "Error: Cannot find 'obj-m' in Makefile" >&2
+            echo "Error: Cannot find 'obj-m' or 'obj-y' in Makefile" >&2
             exit 1
           fi
           echo "Detected module: $MODULE_OBJ"
           echo "module_name=$MODULE_OBJ" >> $GITHUB_OUTPUT
 
-      - name: Build kernel module
+      - name: Install repo tool
         run: |
+          sudo curl -L https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
+          sudo chmod a+x /usr/local/bin/repo
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python-is-python3 clang lld llvm
+          clang --version
+          ld.lld --version
+
+      # ===== 只缓存预编译产物，不缓存源码 =====
+      - name: Restore prebuilt kernel artifacts
+        id: cache-artifacts
+        uses: actions/cache/restore@v4
+        with:
+          path: prebuilt-kernel
+          key: kernel-artifacts-${{ github.event.inputs.android_version }}-${{ github.event.inputs.target_arch }}
+          restore-keys: |
+            kernel-artifacts-${{ github.event.inputs.android_version }}-${{ github.event.inputs.target_arch }}
+
+      # ===== 缓存未命中时，临时同步源码并生成产物（不保存源码） =====
+      - name: Generate prebuilt kernel artifacts
+        if: steps.cache-artifacts.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p android-kernel && cd android-kernel
+          repo init -u https://android.googlesource.com/kernel/manifest -b ${{ github.event.inputs.android_version }}
+          repo sync -j$(nproc) -c --no-tags --optimized-fetch --force-sync
+
+          cd common
+          ARCH="${{ github.event.inputs.target_arch }}"
+          if [ "$ARCH" = "armv7l" ]; then KARCH=arm; else KARCH=arm64; fi
+          DEFCONFIG="arch/$KARCH/configs/gki_defconfig"
+          if [ ! -f "$DEFCONFIG" ]; then
+            KARCH=arm64
+            DEFCONFIG="arch/arm64/configs/gki_defconfig"
+          fi
+          echo "KARCH=$KARCH" >> $GITHUB_ENV
+
+          make ARCH=$KARCH LLVM=1 mrproper
+          make ARCH=$KARCH LLVM=1 gki_defconfig
+          make ARCH=$KARCH LLVM=1 modules_prepare -j$(nproc)
+          # 生成 Module.symvers 和头文件产物
+          make ARCH=$KARCH LLVM=1 modules -j$(nproc)
+
+          # 把编译外部模块所需的产物拷出来，源码树不保留
+          mkdir -p "$GITHUB_WORKSPACE/prebuilt-kernel"
+          cp -a .config Module.symvers include arch scripts Makefile "$GITHUB_WORKSPACE/prebuilt-kernel/" 2>/dev/null || true
+          # 至少保证关键文件存在
+          test -f "$GITHUB_WORKSPACE/prebuilt-kernel/Module.symvers" || { echo "Module.symvers missing"; exit 1; }
+          echo "Prebuilt artifacts generated."
+
+      - name: Save prebuilt kernel artifacts
+        if: steps.cache-artifacts.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: prebuilt-kernel
+          key: kernel-artifacts-${{ github.event.inputs.android_version }}-${{ github.event.inputs.target_arch }}
+
+      # ===== 用预编译产物编译外部模块 =====
+      - name: Build kernel module (external module only)
+        run: |
+          ARCH="${{ github.event.inputs.target_arch }}"
+          if [ "$ARCH" = "armv7l" ]; then KARCH=arm; else KARCH=arm64; fi
+          # 若产物是 arm64 回退生成的，这里也统一
+          if [ ! -d "prebuilt-kernel/arch/$KARCH" ]; then KARCH=arm64; fi
+
           cd kerneldriver
-          make -C $KERNEL_SRC M=$PWD modules
+          make -C ../prebuilt-kernel ARCH=$KARCH LLVM=1 M=$PWD modules -j$(nproc)
 
       - name: Stage driver artifacts
         run: |
           mkdir -p upload_artifact
           TARGET_MODULE="${{ steps.detect_module.outputs.module_name }}"
-          MODULE_FILE=$(find kerneldriver -name "$TARGET_MODULE" -type f | head -1)
+          MODULE_FILE=$(find kerneldriver -maxdepth 1 -name "$TARGET_MODULE" -type f | head -1)
           if [ -z "$MODULE_FILE" ]; then
-            echo "Module not found"
+            echo "❌ Module not found! Available .ko files:"
+            find kerneldriver -name "*.ko" | head -10
             exit 1
           fi
+          echo "✅ Found module at: $MODULE_FILE"
           cp "$MODULE_FILE" upload_artifact/
-          llvm-strip -d "upload_artifact/$TARGET_MODULE" || true
           ls -lh upload_artifact/
 
       - name: Upload artifacts
