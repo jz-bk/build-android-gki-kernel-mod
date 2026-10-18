@@ -47,7 +47,7 @@ jobs:
       - name: Build kernel module
         run: |
           cd kerneldriver
-          make KDIR=$KERNEL_SRC -j$(nproc)
+          make -C $KERNEL_SRC M=$PWD modules -j$(nproc)
 
       - name: Stage driver artifacts
         run: |
