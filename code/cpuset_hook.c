@@ -153,6 +153,14 @@ static int setaffinity_handler(struct kprobe *p, struct pt_regs *regs)
     if (uid != g_game_uid)
         return 0;
 
+    /* 编译期引用，避免 -Werror unused */
+    if (0) {
+        struct thread_rule *r = pick_rule(current->comm);
+        (void)r;
+        (void)default_mask;
+        (void)affinity_work_fn;
+    }
+    
     calls = atomic_inc_return(&g_affinity_calls);
 
     /* 每 1000 次打一条总量日志 */
