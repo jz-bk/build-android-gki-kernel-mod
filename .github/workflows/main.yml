@@ -58,65 +58,72 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python-is-python3 clang lld llvm
-          clang --version
-          ld.lld --version
 
-      - name: Restore kernel source cache
-        id: cache-kernel
+      # 确定架构映射
+      - name: Set kernel arch
+        id: set_arch
+        run: |
+          if [ "${{ github.event.inputs.target_arch }}" = "armv7l" ]; then
+            echo "KARCH=arm" >> $GITHUB_OUTPUT
+          else
+            echo "KARCH=arm64" >> $GITHUB_OUTPUT
+          fi
+
+      # 尝试恢复“已准备好的内核构建环境”
+      - name: Restore prepared kernel build env
+        id: cache-kernel-env
         uses: actions/cache/restore@v4
         with:
           path: android-kernel
-          key: kernel-src-${{ github.event.inputs.android_version }}
-          restore-keys: |
-            kernel-src-${{ github.event.inputs.android_version }}
+          key: kernel-prepared-${{ github.event.inputs.android_version }}-${{ steps.set_arch.outputs.KARCH }}
 
-      - name: Set up Android Kernel source
-        if: steps.cache-kernel.outputs.cache-hit != 'true'
+      # 如果缓存未命中，从源码准备（这一步只在首次运行时发生）
+      - name: Set up Android Kernel source (cold)
+        if: steps.cache-kernel-env.outputs.cache-hit != 'true'
         run: |
           mkdir -p android-kernel && cd android-kernel
           repo init -u https://android.googlesource.com/kernel/manifest -b ${{ github.event.inputs.android_version }}
           repo sync -j$(nproc) -c --no-tags --optimized-fetch --force-sync
 
-      - name: Save kernel source cache
-        if: steps.cache-kernel.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: android-kernel
-          key: kernel-src-${{ github.event.inputs.android_version }}
-
-      - name: Prepare kernel build environment (config + modules_prepare)
+      - name: Prepare kernel build environment (cold only)
+        if: steps.cache-kernel-env.outputs.cache-hit != 'true'
         run: |
           cd android-kernel/common
+          KARCH="${{ steps.set_arch.outputs.KARCH }}"
 
-          ARCH="${{ github.event.inputs.target_arch }}"
-          if [ "$ARCH" = "armv7l" ]; then
-            KARCH=arm
-          else
-            KARCH=arm64
-          fi
-
-          # armv7l 若没有专用 gki_defconfig，回退到 arm64
           DEFCONFIG="arch/$KARCH/configs/gki_defconfig"
           if [ ! -f "$DEFCONFIG" ]; then
-            echo "⚠️  $DEFCONFIG not found, falling back to arm64 gki_defconfig"
+            echo "⚠️  $DEFCONFIG not found, falling back to arm64"
             KARCH=arm64
             DEFCONFIG="arch/arm64/configs/gki_defconfig"
           fi
           echo "KARCH=$KARCH" >> $GITHUB_ENV
 
-          # 先清理源码树，避免残留产物导致 modules_prepare 误入 headers_install
           make ARCH=$KARCH LLVM=1 mrproper
-
-          # 生成 .config（轻量，不编译内核）
           make ARCH=$KARCH LLVM=1 gki_defconfig
-
-          # 生成 Kbuild 编译外部模块所需的头文件和脚本
           make ARCH=$KARCH LLVM=1 modules_prepare -j$(nproc)
-
           make ARCH=$KARCH LLVM=1 modules -j$(nproc)
 
-          echo "Prepared kernel build env with ARCH=$KARCH"
+      # 保存准备好的环境（仅冷运行时）
+      - name: Save prepared kernel build env
+        if: steps.cache-kernel-env.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: android-kernel
+          key: kernel-prepared-${{ github.event.inputs.android_version }}-${{ steps.set_arch.outputs.KARCH }}
 
+      # 热运行时也需要知道 KARCH
+      - name: Set KARCH for build (hot path)
+        if: steps.cache-kernel-env.outputs.cache-hit == 'true'
+        run: |
+          KARCH="${{ steps.set_arch.outputs.KARCH }}"
+          # 检查恢复的环境里是否有 arm 的 defconfig，没有则回退
+          if [ ! -f "android-kernel/common/arch/$KARCH/configs/gki_defconfig" ]; then
+            KARCH=arm64
+          fi
+          echo "KARCH=$KARCH" >> $GITHUB_ENV
+
+      # 只编译你的模块（冷/热都走这里）
       - name: Build kernel module (external module only)
         run: |
           cd kerneldriver
@@ -140,8 +147,6 @@ jobs:
 
           echo "✅ Found module at: $MODULE_FILE"
           cp "$MODULE_FILE" upload_artifact/
-
-          echo "📦 Staged files:"
           ls -lh upload_artifact/
 
       - name: Upload artifacts
