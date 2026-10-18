@@ -102,13 +102,6 @@ static uid_t resolve_pkg_uid(const char *pkg)
     return uid;
 }
 
-/* ---------------- CFI 豁免的间接调用 ---------------- */
-static int call_set_affinity(struct task_struct *t, const struct cpumask *m)
-    __nocfi
-{
-    return set_cpus_allowed_ptr_sym(t, m);
-}
-
 /* ---------------- workqueue 异步绑核 ---------------- */
 struct affinity_work {
     struct work_struct work;
