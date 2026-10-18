@@ -315,9 +315,11 @@ static int set_affinity_pre(struct kprobe *p, struct pt_regs *regs)
 #if defined(CONFIG_X86_64)
     struct task_struct *task = (struct task_struct *)regs->di;
     const struct cpumask *mask = (const struct cpumask *)regs->si;
+    unsigned long caller_ip = regs->ip;
 #elif defined(CONFIG_ARM64)
     struct task_struct *task = (struct task_struct *)regs->regs[0];
     const struct cpumask *mask = (const struct cpumask *)regs->regs[1];
+    unsigned long caller_ip = regs->regs[30];  /* LR = caller return address */
 #else
 #error "unsupported arch"
 #endif
@@ -334,15 +336,14 @@ static int set_affinity_pre(struct kprobe *p, struct pt_regs *regs)
     if (uid != g_game_uid)
         return 0;
 
-    /* Skip our own work's call site; only log external callers. */
-    if (within_module(regs->ip, THIS_MODULE))
+    if (within_module(caller_ip, THIS_MODULE))
         return 0;
 
     atomic64_inc(&cnt_kprobe_ext);
     pr_info_ratelimited("cpuset_hook_v3: EXTERNAL set_affinity pid=%d "
                         "comm=%s want=%*pbl caller=%pS\n",
                         task->pid, task->comm, cpumask_pr_args(mask),
-                        (void *)regs->ip);
+                        (void *)caller_ip);
     return 0;
 }
 
