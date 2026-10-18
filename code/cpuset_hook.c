@@ -36,6 +36,8 @@ static bool fork_trace_registered;
 static bool affinity_hook_registered;
 static bool rename_trace_registered;
 
+static struct workqueue_struct *affinity_wq;
+
 /* Older Android kernels do not export kallsyms_lookup_name to modules. */
 static unsigned long (*kallsyms_lookup_name_sym)(const char *name);
 static int dummy_pre(struct kprobe *p, struct pt_regs *regs) { return 0; }
@@ -145,7 +147,7 @@ static void queue_affinity(struct task_struct *p, const struct cpumask *mask,
     get_task_struct(p);
     aw->task = p;
     cpumask_copy(&aw->mask, mask);
-    if (!schedule_work(&aw->work)) {
+    if (!queue_work(affinity_wq, &aw->work)) {
         put_task_struct(p);
         kfree(aw);
     }
@@ -230,6 +232,13 @@ static int __init cpuset_hook_init(void)
         return -ENOENT;
     }
 
+    /* 创建私有工作队列，放在注册 trace 之前 */
+    affinity_wq = alloc_workqueue("cpuset_hook_wq", 0, 0);
+    if (!affinity_wq) {
+        pr_err("cpuset_hook_v2: alloc_workqueue failed\n");
+        return -ENOMEM;
+    }
+  
     ret = register_trace_sched_process_fork(on_sched_process_fork, NULL);
     if (ret) {
         pr_err("cpuset_hook_v2: register sched_process_fork failed: %d\n", ret);
@@ -273,7 +282,11 @@ static void __exit cpuset_hook_exit(void)
             on_sched_setaffinity_early, NULL);
     if (fork_trace_registered)
         unregister_trace_sched_process_fork(on_sched_process_fork, NULL);
-    flush_scheduled_work();
+
+    if (affinity_wq) {
+        destroy_workqueue(affinity_wq);   /* 内部会 flush 并等待所有已排队工作完成 */
+        affinity_wq = NULL;
+    }
     pr_info("cpuset_hook_v2: unloaded\n");
 }
 
