@@ -113,6 +113,8 @@ jobs:
           # 生成 Kbuild 编译外部模块所需的头文件和脚本
           make ARCH=$KARCH LLVM=1 modules_prepare -j$(nproc)
 
+          make ARCH=$KARCH LLVM=1 modules -j$(nproc)
+
           echo "Prepared kernel build env with ARCH=$KARCH"
 
       - name: Build kernel module (external module only)
